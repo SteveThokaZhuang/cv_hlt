@@ -1,6 +1,6 @@
 ## how to run the code
 - create cosyvoice
-- inside cosyvoice root addr, do ```bash https://github.com/SteveThokaZhuang/cv_hlt.git```
+- inside cosyvoice root addr, do ```bash https://github.com/SteveThokaZhuang/cv_hlt.git```, and follow the env create guidance of **cosyvoice vllm**
 - create text index
 ```bash
 cd src
