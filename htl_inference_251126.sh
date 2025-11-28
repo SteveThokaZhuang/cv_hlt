@@ -1,0 +1,12 @@
+python cosyvoice_htl_251126.py \
+  --model-dir ../pretrained_models/CosyVoice2-0.5B \
+  --jsonl data/control_group_qa_train-2.jsonl \
+  --wav-dir /share/workspace/wangkuang/workspace/git/HSP/speech_dataset/filter_pipeline/filtered_result/batch_0001 \
+  --outdir tts_sample_100 \
+  --num-samples 100 \
+  --random-seed 1145 \
+  --prompt-text "Hey Alex, how was your day? I just finished work, and honestly I'm exhausted and just want to grab some food and chill." \
+  --instances 1 \
+  --workers 4 \
+  --fp16 true \
+  --vllm true
