@@ -37,7 +37,10 @@ import inspect
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Thread, Lock
+import swanlab  # new
 
+# 放在全局位置（比如和 counter_lock 类似的级别）
+SWAN_LOG_LOCK = Lock()
 import torch
 import torchaudio
 
@@ -396,23 +399,23 @@ def worker_thread(
             prompt_speech = load_wav(warmup_ref_audio_path, 16000)
             for _ in range(args.warmup):
                 try:
-                    with model_lock:  # 保护模型调用的线程安全
-                        try:
-                            gen = cosyvoice.inference_zero_shot(
-                                warmup_text,
-                                args.prompt_text,
-                                prompt_speech,
-                                stream=False,
-                                text_frontend=args.text_frontend,
-                            )
-                        except TypeError:
-                            gen = cosyvoice.inference_zero_shot(
-                                warmup_text,
-                                args.prompt_text,
-                                prompt_speech,
-                                stream=False,
-                            )
-                        _ = list(gen)
+                    # with model_lock:  # 保护模型调用的线程安全
+                    try:
+                        gen = cosyvoice.inference_zero_shot(
+                            warmup_text,
+                            args.prompt_text,
+                            prompt_speech,
+                            stream=False,
+                            text_frontend=args.text_frontend,
+                        )
+                    except TypeError:
+                        gen = cosyvoice.inference_zero_shot(
+                            warmup_text,
+                            args.prompt_text,
+                            prompt_speech,
+                            stream=False,
+                        )
+                    _ = list(gen)
                 except Exception as e:
                     print(f"[Warmup] worker#{worker_id} warmup failed: {e}")
                     break
@@ -437,39 +440,39 @@ def worker_thread(
                 prompt_speech = load_wav(ref_audio_path, 16000)
 
                 # 调用 zero-shot TTS（不使用 spkinfo）
-                with model_lock:
-                    try:
-                        gen = cosyvoice.inference_zero_shot(
-                            text,
-                            args.prompt_text,
-                            prompt_speech,
-                            stream=args.stream,
-                            text_frontend=args.text_frontend,
-                        )
-                    except TypeError:
-                        gen = cosyvoice.inference_zero_shot(
-                            text,
-                            args.prompt_text,
-                            prompt_speech,
-                            stream=args.stream,
-                        )
+                # with model_lock:
+                try:
+                    gen = cosyvoice.inference_zero_shot(
+                        text,
+                        args.prompt_text,
+                        prompt_speech,
+                        stream=args.stream,
+                        text_frontend=args.text_frontend,
+                    )
+                except TypeError:
+                    gen = cosyvoice.inference_zero_shot(
+                        text,
+                        args.prompt_text,
+                        prompt_speech,
+                        stream=args.stream,
+                    )
 
-                    if args.stream:
-                        chunks = []
-                        sr = cosyvoice.sample_rate
-                        for pack in gen:
-                            chunks.append(pack["tts_speech"].detach().cpu())
-                        if not chunks:
-                            task_queue.task_done()
-                            continue
-                        audio = torch.cat(chunks, dim=-1)
-                    else:
-                        packs = list(gen)
-                        if not packs:
-                            task_queue.task_done()
-                            continue
-                        audio = packs[-1]["tts_speech"].detach().cpu()
-                        sr = cosyvoice.sample_rate
+                if args.stream:
+                    chunks = []
+                    sr = cosyvoice.sample_rate
+                    for pack in gen:
+                        chunks.append(pack["tts_speech"].detach().cpu())
+                    if not chunks:
+                        task_queue.task_done()
+                        continue
+                    audio = torch.cat(chunks, dim=-1)
+                else:
+                    packs = list(gen)
+                    if not packs:
+                        task_queue.task_done()
+                        continue
+                    audio = packs[-1]["tts_speech"].detach().cpu()
+                    sr = cosyvoice.sample_rate
 
                 gen_time = time.time() - t0
                 num_samples = audio.shape[-1]
@@ -500,7 +503,25 @@ def worker_thread(
                     d = counter["done"]
                     if d % 50 == 0:
                         print(f"[Prog] worker#{worker_id} -> {d} utterances queued for save")
+                # 额外采集一次当前显存使用（可选）
+                gpu_mem_mb = None
+                if torch.cuda.is_available():
+                    gpu_mem_mb = torch.cuda.memory_allocated() / 1024**2
 
+                # SwanLab 日志：一条样本一个点
+                with SWAN_LOG_LOCK:
+                    metrics = {
+                        "tts/gen_time_sec": float(gen_time),
+                        "tts/duration_sec": float(duration_sec),
+                        "tts/real_time_factor": float(duration_sec / gen_time) if gen_time > 0 else None,
+                    }
+                    if gpu_mem_mb is not None:
+                        metrics["gpu/memory_allocated_mb"] = float(gpu_mem_mb)
+                    # 你也可以顺手 log 一下 worker_id 或 idx 方便排查
+                    metrics["meta/worker_id"] = worker_id
+                    metrics["meta/index"] = idx
+
+                    swanlab.log(metrics, step=d)
             except Exception as e:
                 print(f"[Error] worker#{worker_id} failed on index {idx}: {e}")
             finally:
@@ -572,7 +593,32 @@ def main():
     print(f"[Info] Using device: {device}")
     if device.type != "cuda":
         print("[Warning] CUDA not available. This script is designed for GPU use; CPU will be very slow.")
-
+    # ---------------- SwanLab init ----------------
+    run = swanlab.init(
+        project="cv-htl",                      # 自己起个项目名
+        workspace="tohkasensei",
+        experiment_name=time.strftime("run-%Y%m%d-%H%M%S"),
+        config={
+            "model_dir": args.model_dir,
+            "num_samples": args.num_samples,
+            "instances": args.instances,
+            "vllm": bool(args.vllm),
+            "vllm_gpu_mem": args.vllm_gpu_mem,
+        },
+        # 如果想完全离线看板：
+        # mode="local",
+        # logdir="./swanlog_cosyvoice",
+    )
+    if torch.cuda.is_available():
+        dev = torch.cuda.current_device()
+        props = torch.cuda.get_device_properties(dev)
+        swanlab.log({
+            "hardware/gpu_index": dev,
+            "hardware/gpu_name": props.name,
+            "hardware/gpu_total_mem_GB": props.total_memory / 1024**3,
+        })
+    else:
+        swanlab.log({"hardware/device": "cpu"})
     outdir = Path(args.outdir)
     safe_mkdir(outdir)
 
